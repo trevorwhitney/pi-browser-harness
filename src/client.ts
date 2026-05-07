@@ -98,7 +98,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   const session = createCdpSession(transport, ownership);
   const mutationMutex = createMutex();
   let lastHealth = 0;
-  let pageCache: { readonly info: PageInfo; readonly at: number } | null = null;
+  let pageCaches = new Map<string, { readonly info: PageInfo; readonly at: number }>();
   let remote: BrowserClientOptions["remote"] | null = opts.remote ?? null;
 
   const start = async (): Promise<Result<void, CdpError>> => {
@@ -125,13 +125,13 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       return attached;
     }
     lastHealth = Date.now();
-    pageCache = null;
+    pageCaches.clear();
     return ok(undefined);
   };
 
   const stop = async (): Promise<void> => {
     await transport.close();
-    pageCache = null;
+    pageCaches.clear();
     lastHealth = 0;
   };
 
@@ -155,7 +155,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     if (!jsProbe.success && jsProbe.error.kind === "session_not_found") {
       const reattached = await session.attachFirstPage();
       if (reattached.success) {
-        pageCache = null;
+        pageCaches.clear();
         return ok(undefined);
       }
       await stop();
@@ -185,7 +185,9 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
 
   const readPageInfo = async (): Promise<Result<PageInfo, CdpError>> => {
     const dirty = session.drainPageInfoInvalidations();
-    if (pageCache && !dirty && Date.now() - pageCache.at < PAGE_INFO_TTL_MS) return ok(pageCache.info);
+    const currentTid = session.current()?.targetId;
+    const cached = currentTid ? pageCaches.get(currentTid) : undefined;
+    if (cached && !dirty && Date.now() - cached.at < PAGE_INFO_TTL_MS) return ok(cached.info);
     const expr = safeJs`JSON.stringify({url:location.href,title:document.title,w:innerWidth,h:innerHeight,sx:scrollX,sy:scrollY,pw:document.documentElement.scrollWidth,ph:document.documentElement.scrollHeight})`;
     const raw = await evaluateJs(expr);
     if (!raw.success) return raw;
@@ -198,7 +200,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     }
     const info = parsePageInfoPayload(parsedRaw);
     if (!info.success) return info;
-    pageCache = { info: info.data, at: Date.now() };
+    if (currentTid) pageCaches.set(currentTid, { info: info.data, at: Date.now() });
     return ok(info.data);
   };
 
@@ -228,13 +230,17 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     if (survivors.length !== owned.length) ownership.replaceAll(survivors);
     const hw = ownership.harnessWindow();
     if (hw && !live.has(hw)) ownership.setHarnessWindow(undefined);
+    // Prune per-tab page caches for tabs that no longer exist
+    for (const tid of pageCaches.keys()) {
+      if (!live.has(tid)) pageCaches.delete(tid);
+    }
     return ok(tabs);
   };
 
   const switchTab = async (targetId: string): Promise<Result<void, CdpError>> => {
     const r = await session.switchTo(targetId);
     if (!r.success) return r;
-    pageCache = null;
+    // pageCache per-tab: no longer cleared — each tab retains its cache
     // Best-effort: mark the tab title with a green circle so the user can
     // see which tab the agent attached to. CSP or detached frames may
     // block the eval; we don't surface that as a switchTab failure.
@@ -274,7 +280,6 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     if (url && url !== "about:blank") {
       const nav = await session.call("Page.navigate", { url });
       if (!nav.success) return nav;
-      pageCache = null;
     }
     return ok(c.targetId);
   };

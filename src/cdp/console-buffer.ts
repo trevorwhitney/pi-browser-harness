@@ -256,10 +256,8 @@ export const createConsoleBuffer = (capacity = 500): ConsoleBuffer => {
 
     clear() {
       records.clear();
+      nextSeq = 1;
       overflowed = false;
-      // nextSeq is intentionally NOT reset: the cursor remains monotonic across
-      // tab switches so a stale sinceSeq from a previous tab can't accidentally
-      // match new records.
     },
   };
 };

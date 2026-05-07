@@ -6,6 +6,19 @@ import type { CdpTransport } from "./transport";
 import { createNetworkBuffer, type DrainResult, type NetworkFilter } from "./network-buffer";
 import { createConsoleBuffer, type ConsoleDrainResult, type ConsoleFilter } from "./console-buffer";
 
+// Per-tab state. One TabSession exists per known targetId.
+// Dialog, page-info dirty flag, and CDP buffers are per-tab — switching
+// tabs preserves the previous tab's data in its TabSession instead of
+// clearing it.
+type TabSession = {
+  sessionId: string;
+  targetId: string;
+  dialog: DialogInfo | null;
+  pageInfoDirty: boolean;
+  networkBuffer: ReturnType<typeof createNetworkBuffer>;
+  consoleBuffer: ReturnType<typeof createConsoleBuffer>;
+};
+
 export type CdpSession = {
   attachFirstPage(): Promise<Result<{ readonly targetId: string; readonly sessionId: string }, CdpError>>;
   switchTo(targetId: string): Promise<Result<void, CdpError>>;
@@ -25,18 +38,33 @@ export const createCdpSession = (
 ): CdpSession => {
   let sessionId: string | null = null;
   let targetId: string | null = null;
-  let dialog: DialogInfo | null = null;
-  let pageInfoDirty = false;
-  const networkBuffer = createNetworkBuffer();
-  const consoleBuffer = createConsoleBuffer();
+
+  // Per-tab tracking: maps targetId → TabSession and sessionId → targetId for
+  // event routing. Lazy: a TabSession is created on the first visit to a tab.
+  const tabs = new Map<string, TabSession>();
+  const sessionIdToTargetId = new Map<string, string>();
 
   let activeConsumer: Promise<void> = Promise.resolve();
 
+  // Event → TabSession resolver. Uses sessionId from CDP events to find the
+  // correct TabSession, falling back to the current targetId when no sessionId.
+  const resolveTab = (evSessionId?: string): TabSession | undefined => {
+    const tid = evSessionId ? sessionIdToTargetId.get(evSessionId) : targetId;
+    return tid ? tabs.get(tid) : undefined;
+  };
+
   const consumeEvents = async (): Promise<void> => {
     for await (const ev of transport.events()) {
+      // Filter: skip events from sessions we're not currently tracking.
+      // Target.targetDestroyed is browser-level (no sessionId) — always process.
+      if (ev.method !== "Target.targetDestroyed") {
+        if (ev.sessionId && ev.sessionId !== sessionId) continue;
+      }
       if (ev.method === "Page.javascriptDialogOpening") {
+        const tab = targetId ? tabs.get(targetId) : undefined;
+        if (!tab) continue;
         const params = ev.params as Partial<DialogInfo> | undefined;
-        dialog = {
+        tab.dialog = {
           type: (params?.type as DialogInfo["type"]) ?? "alert",
           message: params?.message ?? "",
           ...(params?.defaultPrompt !== undefined ? { defaultPrompt: params.defaultPrompt } : {}),
@@ -48,18 +76,40 @@ export const createCdpSession = (
       // This prevents fast dismiss flows from dropping a dialog the agent
       // was about to read. (Fix for spec §7 predictability bug #2.)
       if (ev.method === "Page.frameNavigated" || ev.method === "Page.loadEventFired") {
-        pageInfoDirty = true;
+        const tab = targetId ? tabs.get(targetId) : undefined;
+        if (tab) tab.pageInfoDirty = true;
       }
       if (ev.method === "Target.targetDestroyed" && ownership) {
         const params = ev.params as { targetId?: string } | undefined;
-        if (params?.targetId) ownership.remove(params.targetId);
+        if (params?.targetId) {
+          ownership.remove(params.targetId);
+          // Prune per-tab state for the destroyed target
+          const tab = tabs.get(params.targetId);
+          if (tab) {
+            sessionIdToTargetId.delete(tab.sessionId);
+            tabs.delete(params.targetId);
+          }
+        }
       }
-      if (ev.method === "Network.requestWillBeSent") networkBuffer.ingestRequestWillBeSent(ev.params);
-      else if (ev.method === "Network.responseReceived") networkBuffer.ingestResponseReceived(ev.params);
-      else if (ev.method === "Network.loadingFinished") networkBuffer.ingestLoadingFinished(ev.params);
-      else if (ev.method === "Network.loadingFailed") networkBuffer.ingestLoadingFailed(ev.params);
-      else if (ev.method === "Runtime.consoleAPICalled") consoleBuffer.ingestConsoleApi(ev.params);
-      else if (ev.method === "Log.entryAdded") consoleBuffer.ingestLogEntry(ev.params);
+      if (ev.method === "Network.requestWillBeSent") {
+        const tab = resolveTab(ev.sessionId);
+        if (tab) tab.networkBuffer.ingestRequestWillBeSent(ev.params);
+      } else if (ev.method === "Network.responseReceived") {
+        const tab = resolveTab(ev.sessionId);
+        if (tab) tab.networkBuffer.ingestResponseReceived(ev.params);
+      } else if (ev.method === "Network.loadingFinished") {
+        const tab = resolveTab(ev.sessionId);
+        if (tab) tab.networkBuffer.ingestLoadingFinished(ev.params);
+      } else if (ev.method === "Network.loadingFailed") {
+        const tab = resolveTab(ev.sessionId);
+        if (tab) tab.networkBuffer.ingestLoadingFailed(ev.params);
+      } else if (ev.method === "Runtime.consoleAPICalled") {
+        const tab = resolveTab(ev.sessionId);
+        if (tab) tab.consoleBuffer.ingestConsoleApi(ev.params);
+      } else if (ev.method === "Log.entryAdded") {
+        const tab = resolveTab(ev.sessionId);
+        if (tab) tab.consoleBuffer.ingestLogEntry(ev.params);
+      }
     }
   };
 
@@ -77,7 +127,8 @@ export const createCdpSession = (
   transport.onClose(() => {
     sessionId = null;
     targetId = null;
-    pageInfoDirty = false;
+    tabs.clear();
+    sessionIdToTargetId.clear();
     // Do NOT clear `dialog` here — same rationale as inside consumeEvents:
     // the agent may have a pending takeDialog() call that should still see it.
     restartConsumer();
@@ -116,6 +167,15 @@ export const createCdpSession = (
         const hw = ownership.harnessWindow();
         if (hw && !live.has(hw)) ownership.setHarnessWindow(undefined);
       }
+      // Prune per-tab state for pages that no longer exist
+      const liveTargetIds = new Set(allPages.map((p) => p.targetId));
+      for (const tid of tabs.keys()) {
+        if (!liveTargetIds.has(tid)) {
+          const tab = tabs.get(tid);
+          if (tab) sessionIdToTargetId.delete(tab.sessionId);
+          tabs.delete(tid);
+        }
+      }
 
       // Prefer attaching to a tab this session already owns. Falls back to
       // creating a fresh harness-owned tab in a dedicated window — never
@@ -144,6 +204,15 @@ export const createCdpSession = (
       sessionId = a.sessionId;
       targetId = pickTargetId;
       await enableDomains(a.sessionId);
+      tabs.set(pickTargetId, {
+        sessionId: a.sessionId,
+        targetId: pickTargetId,
+        dialog: null,
+        pageInfoDirty: false,
+        networkBuffer: createNetworkBuffer(),
+        consoleBuffer: createConsoleBuffer(),
+      });
+      sessionIdToTargetId.set(a.sessionId, pickTargetId);
       return ok({ targetId: pickTargetId, sessionId: a.sessionId });
     },
     async switchTo(tid) {
@@ -152,14 +221,29 @@ export const createCdpSession = (
       const attached = await transport.request("Target.attachToTarget", { targetId: tid, flatten: true }, { sessionId: null });
       if (!attached.success) return attached;
       const a = attached.data as { sessionId: string };
-      sessionId = a.sessionId;
+      // Reuse existing TabSession or create one on first visit
+      const existing = tabs.get(tid);
+      const tab: TabSession = existing ?? {
+        sessionId: a.sessionId,
+        targetId: tid,
+        dialog: null,
+        pageInfoDirty: true,
+        networkBuffer: createNetworkBuffer(),
+        consoleBuffer: createConsoleBuffer(),
+      };
+      if (existing) {
+        // Each Target.attachToTarget produces a new sessionId — update it.
+        sessionIdToTargetId.delete(existing.sessionId);
+        existing.sessionId = a.sessionId;
+        sessionIdToTargetId.set(a.sessionId, tid);
+      } else {
+        tabs.set(tid, tab);
+        await enableDomains(a.sessionId);
+        sessionIdToTargetId.set(a.sessionId, tid);
+      }
+      // Update global pointers to point at the new active tab
+      sessionId = tab.sessionId;
       targetId = tid;
-      pageInfoDirty = true;
-      // Buffer is page-scoped: on switch, the network history of the previous
-      // tab is no longer relevant to what the agent is now looking at.
-      networkBuffer.clear();
-      consoleBuffer.clear();
-      await enableDomains(a.sessionId);
       return ok(undefined);
     },
     current() {
@@ -175,20 +259,28 @@ export const createCdpSession = (
       return transport.request(method, params, { sessionId: null, ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}) });
     },
     takeDialog() {
-      const d = dialog;
-      dialog = null;
+      const tab = targetId ? tabs.get(targetId) : undefined;
+      if (!tab) return null;
+      const d = tab.dialog;
+      tab.dialog = null;
       return d;
     },
     drainPageInfoInvalidations() {
-      const dirty = pageInfoDirty;
-      pageInfoDirty = false;
+      const tab = targetId ? tabs.get(targetId) : undefined;
+      if (!tab) return false;
+      const dirty = tab.pageInfoDirty;
+      tab.pageInfoDirty = false;
       return dirty;
     },
     drainNetworkBuffer(filter) {
-      return networkBuffer.drain(filter);
+      const tab = targetId ? tabs.get(targetId) : undefined;
+      if (!tab) return { records: [], total: 0, bufferOverflowed: false };
+      return tab.networkBuffer.drain(filter);
     },
     drainConsoleBuffer(filter) {
-      return consoleBuffer.drain(filter);
+      const tab = targetId ? tabs.get(targetId) : undefined;
+      if (!tab) return { records: [], total: 0, bufferOverflowed: false };
+      return tab.consoleBuffer.drain(filter);
     },
   };
 };

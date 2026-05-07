@@ -74,6 +74,8 @@ browser_screenshot() + browser_page_info() + browser_execute_js("document.title"
 browser_http_get("https://api.example.com/data") + browser_click(x, y)
 \`\`\`
 
+**Multi-agent note**: When multiple subagents use the browser, tab switching by one agent changes the active tab for all agents. Per-tab data (console buffers, network traces, dialogs, page info cache) is isolated — switching tabs does not destroy another agent's collected data. Call \`browser_current_tab\` before mutation tools to confirm you're on the expected tab. If \`browser_page_info\` returns a dialog, handle it with \`browser_handle_dialog\` promptly — dialogs block page interaction and are not queued across agents.
+
 ### Common Patterns
 
 **Navigation:**
