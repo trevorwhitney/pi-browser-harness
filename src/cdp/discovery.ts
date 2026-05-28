@@ -138,10 +138,27 @@ const queryLiveWsUrl = async (port: number, timeoutMs = 1500): Promise<string | 
   });
 };
 
+// Well-known CDP ports to probe when DevToolsActivePort files are unreadable
+// (sandboxed pi, restricted filesystem permissions, unusual profile locations
+// like Snap/Flatpak that aren't on our profileDirs list). The default Chromium
+// remote-debugging port is 9222; users can extend with BU_CDP_PORTS="9222,9333".
+const fallbackPorts = (): ReadonlyArray<number> => {
+  const fromEnv = process.env["BU_CDP_PORTS"];
+  const ports = new Set<number>([9222]);
+  if (fromEnv) {
+    for (const tok of fromEnv.split(",")) {
+      const n = Number(tok.trim());
+      if (Number.isFinite(n) && n > 0 && n < 65536) ports.add(n);
+    }
+  }
+  return Array.from(ports);
+};
+
 export const discoverWsUrl = async (): Promise<Result<string, CdpError>> => {
   const dirs = profileDirs();
   type Candidate = { readonly base: string; readonly port: number; readonly path: string; readonly mtimeMs: number };
   const candidates: Candidate[] = [];
+  const readErrors: string[] = [];
   for (const base of dirs) {
     const portFile = join(base, "DevToolsActivePort");
     let raw: string;
@@ -155,9 +172,17 @@ export const discoverWsUrl = async (): Promise<Result<string, CdpError>> => {
         // mtime is a tiebreaker; ignore stat failures
       }
     } catch (e) {
-      // Node fs errors carry .code; see ErrnoException
+      // Node fs errors carry .code; see ErrnoException. ENOENT is normal
+      // (the dir is on our list but the user hasn't installed that browser).
+      // EPERM/EACCES is common under sandboxes (e.g. macOS sandbox-exec); we
+      // remember it and fall back to network probing if no candidate is
+      // readable, rather than failing the whole discovery.
       const code = (e as NodeJS.ErrnoException).code;
       if (code === "ENOENT" || code === undefined) continue;
+      if (code === "EPERM" || code === "EACCES") {
+        readErrors.push(`${portFile}: ${code}`);
+        continue;
+      }
       return err(cdpError("discovery_failed", `failed to read ${portFile}: ${e instanceof Error ? e.message : String(e)}`));
     }
     const lines = raw.trim().split("\n");
@@ -169,10 +194,25 @@ export const discoverWsUrl = async (): Promise<Result<string, CdpError>> => {
   }
 
   if (candidates.length === 0) {
-  return err(cdpError(
-    "discovery_failed",
-    `DevToolsActivePort not found in ${dirs.join(", ")} — open chrome://inspect/#remote-debugging in your browser, tick the checkbox, click Allow, then retry. Or set BU_CDP_WS to a remote browser endpoint.`,
-  ));
+    // Fall back to probing well-known CDP ports. Useful when (a) the harness
+    // runs in a sandbox that can't read browser profile dirs, (b) the browser
+    // was installed somewhere we don't enumerate (Snap/Flatpak in non-default
+    // locations), or (c) the user is reaching a remote CDP endpoint forwarded
+    // to localhost. Requires the browser to have been launched with
+    // --remote-debugging-port so /json/version is served.
+    for (const port of fallbackPorts()) {
+      if (!(await quickProbe(port))) continue;
+      const live = await queryLiveWsUrl(port);
+      if (live) return ok(live);
+    }
+    const permHint = readErrors.length > 0
+      ? `\n\nDevToolsActivePort reads were denied (${readErrors.join(", ")}); ` +
+        `if you're running in a sandbox, grant read access to those files or set BU_CDP_WS / BU_CDP_PORTS to bypass file discovery.`
+      : "";
+    return err(cdpError(
+      "discovery_failed",
+      `DevToolsActivePort not found in ${dirs.join(", ")} — open chrome://inspect/#remote-debugging (or brave://inspect, edge://inspect) in your browser, tick the checkbox, click Allow, then retry. Or set BU_CDP_WS to a remote browser endpoint.${permHint}`,
+    ));
   }
 
   // Disambiguate candidates sharing a port (e.g. one browser running and
@@ -194,7 +234,9 @@ export const discoverWsUrl = async (): Promise<Result<string, CdpError>> => {
   const ordered = live.length > 0 ? live : uniqueCandidates;
 
   // For each candidate, prefer asking the live browser for its canonical WS URL
-  // via /json/version. Some browsers disable the HTTP discovery endpoints, so we fall back to the WS path written
+  // via /json/version. Some browsers (notably Chrome/Brave when remote debugging
+  // is enabled only via chrome://inspect rather than --remote-debugging-port)
+  // disable the HTTP discovery endpoints, so we fall back to the WS path written
   // to DevToolsActivePort.
   let lastErr: Result<string, CdpError> | null = null;
   for (const c of ordered) {
