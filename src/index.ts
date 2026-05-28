@@ -115,17 +115,15 @@ export default function browserHarnessExtension(pi: ExtensionAPI): void {
         persistState(pi, state);
       },
     });
-    // failure is fine — surfaced via tool errors when the agent first tries to use the browser
-    await client.start();
+    // Don't auto-connect: client.start() creates a fresh harness window via
+    // Target.createTarget, which pops a browser window on every pi session.
+    // /browser-setup is the explicit opt-in trigger.
     if (!toolsRegistered) {
       registerAllTools(pi, client);
       toolsRegistered = true;
     }
     registerSetupCommand(pi, client);
-    ctx.ui.setStatus(
-      "browser",
-      client.status().alive ? "🟢 Browser connected" : "🔴 Browser — run /browser-setup",
-    );
+    ctx.ui.setStatus("browser", "🔴 Browser — run /browser-setup");
   });
 
   pi.on("session_shutdown", async () => {
