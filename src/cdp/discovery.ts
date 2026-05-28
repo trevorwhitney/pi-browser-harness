@@ -169,10 +169,10 @@ export const discoverWsUrl = async (): Promise<Result<string, CdpError>> => {
   }
 
   if (candidates.length === 0) {
-    return err(cdpError(
-      "discovery_failed",
-      `DevToolsActivePort not found in ${dirs.join(", ")} — open chrome://inspect/#remote-debugging (or brave://inspect, edge://inspect) in your browser, tick the checkbox, click Allow, then retry. Or set BU_CDP_WS to a remote browser endpoint.`,
-    ));
+  return err(cdpError(
+    "discovery_failed",
+    `DevToolsActivePort not found in ${dirs.join(", ")} — open chrome://inspect/#remote-debugging in your browser, tick the checkbox, click Allow, then retry. Or set BU_CDP_WS to a remote browser endpoint.`,
+  ));
   }
 
   // Disambiguate candidates sharing a port (e.g. one browser running and
@@ -194,9 +194,7 @@ export const discoverWsUrl = async (): Promise<Result<string, CdpError>> => {
   const ordered = live.length > 0 ? live : uniqueCandidates;
 
   // For each candidate, prefer asking the live browser for its canonical WS URL
-  // via /json/version. Some browsers (notably Chrome/Brave when remote debugging
-  // is enabled only via chrome://inspect rather than --remote-debugging-port)
-  // disable the HTTP discovery endpoints, so we fall back to the WS path written
+  // via /json/version. Some browsers disable the HTTP discovery endpoints, so we fall back to the WS path written
   // to DevToolsActivePort.
   let lastErr: Result<string, CdpError> | null = null;
   for (const c of ordered) {

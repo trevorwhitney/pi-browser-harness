@@ -45,15 +45,9 @@ async function runSetup(ctx: ExtensionContext, client: BrowserClient): Promise<v
     ) {
       ctx.ui.notify(
         "Chrome remote debugging needs to be enabled.\n\n" +
-          "The most reliable way is to quit your browser and relaunch it from\n" +
-          "the command line with --remote-debugging-port=9222. For example:\n\n" +
-          "  macOS:   open -na 'Google Chrome' --args --remote-debugging-port=9222\n" +
-          "  Linux:   google-chrome --remote-debugging-port=9222 &\n" +
-          "  Windows: chrome.exe --remote-debugging-port=9222\n\n" +
-          "Then run /browser-setup again. The chrome://inspect 'Discover network\n" +
-          "targets' checkbox works in some builds but is unreliable on Brave and\n" +
-          "some Chromium forks. Alternatively, set BU_CDP_WS to a remote browser\n" +
-          "WebSocket URL.",
+        "Open chrome://inspect/#remote-debugging in your browser, tick the\n" +
+        "\"Discover network targets\" / Allow checkbox, then run /browser-setup again.\n\n" +
+        "Or set BU_CDP_WS to a remote browser WebSocket URL.",
         "warning",
       );
       return;
