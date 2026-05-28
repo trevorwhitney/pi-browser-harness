@@ -45,9 +45,15 @@ async function runSetup(ctx: ExtensionContext, client: BrowserClient): Promise<v
     ) {
       ctx.ui.notify(
         "Chrome remote debugging needs to be enabled.\n\n" +
-          "Open chrome://inspect/#remote-debugging in your browser, tick the\n" +
-          "\"Discover network targets\" / Allow checkbox, then run /browser-setup again.\n\n" +
-          "Or set BU_CDP_WS to a remote browser WebSocket URL.",
+          "The most reliable way is to quit your browser and relaunch it from\n" +
+          "the command line with --remote-debugging-port=9222. For example:\n\n" +
+          "  macOS:   open -na 'Google Chrome' --args --remote-debugging-port=9222\n" +
+          "  Linux:   google-chrome --remote-debugging-port=9222 &\n" +
+          "  Windows: chrome.exe --remote-debugging-port=9222\n\n" +
+          "Then run /browser-setup again. The chrome://inspect 'Discover network\n" +
+          "targets' checkbox works in some builds but is unreliable on Brave and\n" +
+          "some Chromium forks. Alternatively, set BU_CDP_WS to a remote browser\n" +
+          "WebSocket URL.",
         "warning",
       );
       return;
@@ -81,21 +87,39 @@ async function runSetup(ctx: ExtensionContext, client: BrowserClient): Promise<v
 function checkChromeRunning(): boolean {
   try {
     if (process.platform === "darwin") {
-      // Exact line matching — excludes "Google Chrome Helper" etc.
-      // that linger after the user quits the browser.
+      // On macOS, `ps -o comm=` returns full executable paths like
+      // `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`,
+      // so we substring-match against the basename and exclude sub-processes
+      // (helpers, renderers, GPU, crashpad) that linger after quit.
       const out = execSync("ps -A -o comm=", { timeout: 5000 }).toString().toLowerCase();
       const lines = out.split("\n").map((l) => l.trim()).filter(Boolean);
-      const browserProcesses = ["google chrome", "chromium", "microsoft edge"];
+      const browserNames = [
+        "google chrome",
+        "chromium",
+        "microsoft edge",
+        "brave browser",
+        "arc",
+        "vivaldi",
+        "opera",
+      ];
       return lines.some((l) => {
-        if (l.includes("helper") || l.includes("renderer")) return false;
-        return browserProcesses.includes(l);
+        if (
+          l.includes("helper") ||
+          l.includes("renderer") ||
+          l.includes("crashpad") ||
+          l.includes(" gpu") ||
+          l.includes("updater")
+        ) return false;
+        // Match against the basename of the executable path.
+        const base = l.split("/").pop() ?? l;
+        return browserNames.some((name) => base.startsWith(name));
       });
     } else if (process.platform === "linux") {
       // Use args to distinguish the main browser process from sub-processes
       // (GPU, renderer, utility, etc.) which carry --type= flags.
       const out = execSync("ps -A -o comm=,args=", { timeout: 5000 }).toString().toLowerCase();
       const lines = out.split("\n").map((l) => l.trim()).filter(Boolean);
-      const browserComms = ["chrome", "chromium", "chromium-browser", "msedge", "microsoft-edge", "google-chrome"];
+      const browserComms = ["chrome", "chromium", "chromium-browser", "msedge", "microsoft-edge", "google-chrome", "brave", "brave-browser"];
       return lines.some((line) => {
         const parts = line.split(/\s+/);
         const comm = parts[0] ?? "";
@@ -105,7 +129,7 @@ function checkChromeRunning(): boolean {
       });
     } else if (process.platform === "win32") {
       const out = execSync("tasklist", { timeout: 5000 }).toString().toLowerCase();
-      return ["chrome.exe", "msedge.exe"].some((n) => out.includes(n));
+      return ["chrome.exe", "msedge.exe", "brave.exe"].some((n) => out.includes(n));
     }
   } catch {
     // best-effort
